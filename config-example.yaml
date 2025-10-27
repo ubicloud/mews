@@ -1,0 +1,74 @@
+# Mews Configuration Example
+# TLS-terminating HTTP proxy with SSH bastion support and certificate pinning
+
+# Define bastion sets - each set provides access to a distinct group of upstreams
+bastions:
+  # Datacenter 1 bastions
+  dc1-bastions:
+    - name: "bastion-a"
+      host: "bastion-a.dc1.example.com"
+      port: "22"
+      user: "admin"
+      fingerprint: "SHA256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    - name: "bastion-b"
+      host: "bastion-b.dc1.example.com"
+      port: "22"
+      user: "admin"
+      fingerprint: "SHA256:2345678901bcdef02345678901bcdef02345678901bcdef02345678901bcdef0"
+    - name: "bastion-c"
+      host: "bastion-c.dc1.example.com"
+      port: "22"
+      user: "admin"
+      fingerprint: "SHA256:3456789012cdef013456789012cdef013456789012cdef013456789012cdef01"
+  
+  # Datacenter 2 bastions
+  dc2-bastions:
+    - name: "bastion-d"
+      host: "bastion-d.dc2.example.com"
+      port: "22"
+      user: "admin"
+      fingerprint: "SHA256:4567890123def0124567890123def0124567890123def0124567890123def012"
+    - name: "bastion-e"
+      host: "bastion-e.dc2.example.com"
+      port: "22"
+      user: "admin"
+      fingerprint: "SHA256:567890124ef01235678901234ef01235678901234ef01235678901234ef0123"
+
+# Define upstreams
+# Note: .localhost suffix is automatically appended to all local names
+# fingerprint is REQUIRED for all upstreams (certificate pinning is mandatory)
+upstreams:
+  # Upstreams in datacenter 1
+  - local: "bmc1"
+    remote: "https://10.1.1.1"
+    bastion_set: "dc1-bastions"
+    fingerprint: "a3d0405e7f32a7a2b408974830bfe673b9f3e8c76600df73e7e809d0dff09d18"
+  
+  - local: "bmc2"
+    remote: "https://10.1.1.2"
+    bastion_set: "dc1-bastions"
+    fingerprint: "b4e1516f8g43b8b3c519085941cfg784c0g4f9d87711eg84f8f920e1egg10e29"
+  
+  # Upstreams in datacenter 2
+  - local: "bmc3"
+    remote: "https://10.2.1.1"
+    bastion_set: "dc2-bastions"
+    fingerprint: "c5f2627g9h54c9c4d620196052dgh895d1h5g0e98822fh95g9g031f2fhh21f30"
+
+# How to discover SSH host key fingerprints:
+# Use ssh-keyscan to get the host key fingerprint:
+#
+#   ssh-keyscan -t ed25519,rsa bastion-a.dc1.example.com 2>/dev/null | \
+#   ssh-keygen -lf - | awk '{print $2}'
+#
+# The proxy will reject configuration if any bastion is missing fingerprint
+
+# How to discover TLS certificate fingerprints:
+# Use openssl to get the fingerprint before adding to config:
+#
+#   openssl s_client -connect 10.1.1.1:443 < /dev/null 2>/dev/null | \
+#   openssl x509 -fingerprint -sha256 -noout | \
+#   cut -d'=' -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]'
+#
+# The proxy will reject configuration if any upstream is missing fingerprint
+
