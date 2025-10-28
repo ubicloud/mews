@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -287,7 +288,80 @@ func (ps *Server) createReverseProxy(targetURL string, transport *http.Transport
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = transport
 	proxy.ErrorHandler = ps.handleProxyError
+	proxy.ModifyResponse = ps.rewriteProtocolInResponse
 	return proxy
+}
+
+// rewriteProtocolInResponse rewrites wss:// to ws:// and https:// to http:// in HTML/JS responses
+// This allows BMC JavaScript that expects HTTPS to work over plain HTTP
+func (ps *Server) rewriteProtocolInResponse(resp *http.Response) error {
+	contentType := resp.Header.Get("Content-Type")
+
+	// Only rewrite text-based content that might contain WebSocket URLs
+	if !strings.Contains(contentType, "text/html") &&
+		!strings.Contains(contentType, "text/javascript") &&
+		!strings.Contains(contentType, "application/javascript") &&
+		!strings.Contains(contentType, "application/x-javascript") {
+		return nil
+	}
+
+	log.Printf("DEBUG: Rewriting response for %s (Content-Type: %s, Content-Encoding: %s)",
+		resp.Request.URL.Path, contentType, resp.Header.Get("Content-Encoding"))
+
+	// Get the hostname from the request
+	hostname := resp.Request.Host
+
+	// Check if we need to rewrite anything for this hostname
+	// If not, skip the expensive body reading
+	// (We can't check without reading, but we can at least log it)
+
+	// Decompress if needed
+	var reader io.ReadCloser = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	}
+
+	// Read the (possibly decompressed) response body
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	// Rewrite wss:// to ws:// and https:// to http:// in a single pass
+	// This handles:
+	// - Template literals: wss://${window.location.host}
+	// - Literal URLs: wss://ubi-1.localhost:6189
+	// - Protocol strings: "wss:" or 'wss:'
+	// - HTTPS URLs for this hostname
+	replacer := strings.NewReplacer(
+		"wss://", "ws://",
+		`"wss:"`, `"ws:"`,
+		`'wss:'`, `'ws:'`,
+		"https://"+hostname, "http://"+hostname,
+	)
+	modified := replacer.Replace(string(body))
+
+	// Update response body with uncompressed content
+	resp.Body = io.NopCloser(strings.NewReader(modified))
+	resp.ContentLength = int64(len(modified))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+
+	// Remove Content-Encoding since we're sending uncompressed
+	resp.Header.Del("Content-Encoding")
+
+	if len(modified) != len(body) {
+		log.Printf("Rewrote protocol in %s response (%d -> %d bytes)", contentType, len(body), len(modified))
+	} else {
+		log.Printf("DEBUG: No changes needed for %s (hostname: %s)", resp.Request.URL.Path, hostname)
+	}
+
+	return nil
 }
 
 func (ps *Server) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
