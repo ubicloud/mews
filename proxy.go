@@ -252,27 +252,33 @@ func (ps *Server) startConnection(bastionSetName string) {
 	ps.connMu.RUnlock()
 
 	ps.connMu.Lock()
-	defer ps.connMu.Unlock()
-
 	// Double-check
 	if ps.connections[bastionSetName] != nil {
+		ps.connMu.Unlock()
 		return
 	}
 
 	bastions, ok := ps.config.BastionSets[bastionSetName]
 	if !ok {
+		ps.connMu.Unlock()
 		log.Printf("Bastion set %s not found", bastionSetName)
 		return
 	}
 
+	// Create connection object and add to map immediately
+	// This prevents duplicate connection attempts
 	log.Printf("Starting connection to bastion set %s...", bastionSetName)
 	conn := NewConnection(bastionSetName, bastions)
+	ps.connections[bastionSetName] = conn
+	ps.connMu.Unlock()
+
+	// Connect OUTSIDE the lock to avoid blocking other requests
+	// This allows requests to other bastions to proceed while waiting for YubiKey touch
 	if err := conn.Connect(); err != nil {
 		log.Printf("Failed to connect to bastion set %s: %v", bastionSetName, err)
 		return
 	}
 
-	ps.connections[bastionSetName] = conn
 	log.Printf("Successfully connected to bastion set %s", bastionSetName)
 }
 
