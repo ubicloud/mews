@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -74,6 +77,13 @@ func (ps *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ps.handleWaitingPage(w, upstream)
 			return
 		}
+	}
+
+	// Check if this is a WebSocket upgrade request
+	if isWebSocketRequest(r) {
+		log.Printf("WebSocket upgrade detected for %s%s", r.Host, r.URL.Path)
+		ps.handleWebSocket(w, r, upstream)
+		return
 	}
 
 	targetURL, err := buildUpstreamURL(upstream, r.Host)
@@ -395,5 +405,151 @@ func createTLSConfig(upstream *Upstream, hostname string) *tls.Config {
 			log.Printf("Certificate pinning verified for %s (sha256:%s)", hostname, calculateFingerprint(cert))
 			return nil
 		},
+	}
+}
+
+// WebSocket support
+
+func isWebSocketRequest(r *http.Request) bool {
+	connection := strings.ToLower(r.Header.Get("Connection"))
+	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
+	return strings.Contains(connection, "upgrade") && upgrade == "websocket"
+}
+
+func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstream *Upstream) {
+	targetURL, err := buildUpstreamURL(upstream, r.Host)
+	if err != nil {
+		log.Printf("Error building upstream URL for WebSocket: %v", err)
+		http.Error(w, "Invalid upstream configuration", http.StatusInternalServerError)
+		return
+	}
+
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		log.Printf("Error parsing target URL: %v", err)
+		http.Error(w, "Invalid target URL", http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure the host includes a port
+	dialAddr := parsedURL.Host
+	if !strings.Contains(dialAddr, ":") {
+		if parsedURL.Scheme == "https" {
+			dialAddr += ":443"
+		} else {
+			dialAddr += ":80"
+		}
+	}
+
+	// Hijack the client connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("Error hijacking connection: %v", err)
+		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	// Dial the upstream server
+	var upstreamConn net.Conn
+	if upstream.BastionSet != "" {
+		conn, err := ps.getOrCreateConnection(upstream.BastionSet)
+		if err != nil {
+			log.Printf("Error getting bastion connection: %v", err)
+			return
+		}
+		upstreamConn, err = conn.Dial(r.Context(), "tcp", dialAddr)
+		if err != nil {
+			log.Printf("Error dialing through bastion: %v", err)
+			return
+		}
+	} else {
+		upstreamConn, err = net.Dial("tcp", dialAddr)
+		if err != nil {
+			log.Printf("Error dialing upstream: %v", err)
+			return
+		}
+	}
+	defer upstreamConn.Close()
+
+	// Wrap with TLS
+	hostname := stripPort(parsedURL.Host)
+	tlsConfig := createTLSConfig(upstream, hostname)
+	tlsConn := tls.Client(upstreamConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("TLS handshake failed: %v", err)
+		return
+	}
+	defer tlsConn.Close()
+
+	// Manually write the HTTP upgrade request as raw text
+	path := r.URL.Path
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+
+	log.Printf("WS: Sending upgrade request to %s with Host=%s, Origin=%s", parsedURL, hostname, parsedURL.Scheme+"://"+hostname)
+
+	// Write request line
+	fmt.Fprintf(tlsConn, "GET %s HTTP/1.1\r\n", path)
+	fmt.Fprintf(tlsConn, "Host: %s\r\n", hostname)
+	fmt.Fprintf(tlsConn, "Upgrade: websocket\r\n")
+	fmt.Fprintf(tlsConn, "Connection: Upgrade\r\n")
+	fmt.Fprintf(tlsConn, "Sec-WebSocket-Version: %s\r\n", r.Header.Get("Sec-WebSocket-Version"))
+	fmt.Fprintf(tlsConn, "Sec-WebSocket-Key: %s\r\n", r.Header.Get("Sec-WebSocket-Key"))
+
+	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		fmt.Fprintf(tlsConn, "Sec-WebSocket-Protocol: %s\r\n", proto)
+	}
+	if ext := r.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
+		fmt.Fprintf(tlsConn, "Sec-WebSocket-Extensions: %s\r\n", ext)
+	}
+
+	fmt.Fprintf(tlsConn, "Origin: %s://%s\r\n", parsedURL.Scheme, hostname)
+
+	if cookie := r.Header.Get("Cookie"); cookie != "" {
+		fmt.Fprintf(tlsConn, "Cookie: %s\r\n", cookie)
+	}
+
+	// End headers
+	fmt.Fprintf(tlsConn, "\r\n")
+
+	// Read the upgrade response
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), r)
+	if err != nil {
+		log.Printf("WS ERROR: Reading upgrade response: %v", err)
+		return
+	}
+	log.Printf("WS: Received response: %d %s", resp.StatusCode, resp.Status)
+
+	// Forward the response to the client
+	if err := resp.Write(clientConn); err != nil {
+		log.Printf("Error writing response to client: %v", err)
+		return
+	}
+
+	// If upgrade successful, start bidirectional copy
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		log.Printf("WebSocket connection established for %s -> %s", r.Host, targetURL)
+		done := make(chan struct{}, 2)
+
+		go func() {
+			io.Copy(tlsConn, clientConn)
+			done <- struct{}{}
+		}()
+
+		go func() {
+			io.Copy(clientConn, tlsConn)
+			done <- struct{}{}
+		}()
+
+		<-done
+		log.Printf("WebSocket connection closed for %s", r.Host)
 	}
 }
