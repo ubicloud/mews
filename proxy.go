@@ -109,7 +109,7 @@ func (ps *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (ps *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, "<h1>TLS Proxy</h1><table border=1><tr><th>Local<th>Remote<th>Bastion Set</tr>")
+	fmt.Fprintf(w, "<h1>Mews</h1><table border=1><tr><th>Local<th>Remote<th>Bastion Set</tr>")
 	for _, u := range ps.upstreams {
 		link := fmt.Sprintf("http://%s:%s/", u.Local, ps.port)
 		fmt.Fprintf(w, "<tr><td><a href=%q>%s</a><td>%s<td>%s</tr>", link, u.Local, u.Remote, u.BastionSet)
