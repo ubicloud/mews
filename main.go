@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	configFile := flag.String("config", "config.yaml", "Path to configuration file")
+	configFile := flag.String("config", "mews.yaml", "Path to configuration file")
 	port := flag.String("port", "6189", "Port to listen on (always binds to localhost)")
 	flag.Parse()
 

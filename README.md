@@ -21,7 +21,7 @@ themselves to implement this, so the feature remains usable.
 `mews` exclusively relies on ssh agent protocol for its credentials
 via `SSH_AUTH_SOCK`, just like the openssh `ssh` binary.
 
-### Minimal `config.yaml` example
+### Minimal `mews.yaml` example
 
 ```yaml
 bastions:
@@ -46,7 +46,7 @@ upstreams:
 ./mews
 
 # Custom port on localhost and configuration file
-./mews --config config.yaml --port 3000
+./mews --config mews.yaml --port 3000
 ```
 
 Visit `http://localhost:6189/` to see the index page with all configured upstreams.
