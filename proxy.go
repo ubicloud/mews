@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -317,13 +318,23 @@ func (ps *Server) rewriteProtocolInResponse(resp *http.Response) error {
 
 	// Decompress if needed
 	var reader io.ReadCloser = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	if contentEncoding == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return err
 		}
 		defer gzReader.Close()
 		reader = gzReader
+	} else if contentEncoding == "deflate" {
+		// deflate is zlib compression (RFC 1950)
+		// Go's flate.NewReader expects raw deflate (RFC 1951), so we need zlib.NewReader
+		zlibReader, err := zlib.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		defer zlibReader.Close()
+		reader = zlibReader
 	}
 
 	// Read the (possibly decompressed) response body

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -11,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -419,5 +423,150 @@ upstreams:
 	}
 	if !strings.Contains(err.Error(), "fingerprint is required") {
 		t.Errorf("Expected error about missing pin, got: %v", err)
+	}
+}
+
+func TestRewriteProtocolInResponse(t *testing.T) {
+	// Create a test server
+	ps := &Server{
+		config:      &Config{},
+		upstreams:   []Upstream{},
+		port:        "6189",
+		connections: make(map[string]*Connection),
+		transports:  make(map[string]*http.Transport),
+	}
+
+	tests := []struct {
+		name            string
+		contentType     string
+		contentEncoding string
+		body            string
+		hostname        string
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:            "deflate compressed HTML with wss://",
+			contentType:     "text/html",
+			contentEncoding: "deflate",
+			body:            `<script>var ws = new WebSocket("wss://" + window.location.host);</script>`,
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{`"ws://"`, `window.location.host`},
+			wantNotContains: []string{`"wss://"`},
+		},
+		{
+			name:            "gzip compressed JavaScript with wss://",
+			contentType:     "application/javascript;charset=UTF-8",
+			contentEncoding: "gzip",
+			body:            `const protocol = "wss:"; const url = protocol + "//" + host;`,
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{`"ws:"`},
+			wantNotContains: []string{`"wss:"`},
+		},
+		{
+			name:            "deflate compressed with https:// for same hostname",
+			contentType:     "text/html",
+			contentEncoding: "deflate",
+			body:            `<a href="https://test.localhost:6189/page">Link</a>`,
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{`http://test.localhost:6189/page`},
+			wantNotContains: []string{`https://test.localhost:6189`},
+		},
+		{
+			name:            "no compression",
+			contentType:     "text/html",
+			contentEncoding: "",
+			body:            `<script>new WebSocket('wss://example.com');</script>`,
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{`'ws://example.com'`},
+			wantNotContains: []string{`'wss://`},
+		},
+		{
+			name:            "non-text content type (skip rewriting)",
+			contentType:     "image/png",
+			contentEncoding: "",
+			body:            "binary image data",
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{"binary image data"},
+			wantNotContains: []string{},
+		},
+		{
+			name:            "application/x-javascript content type",
+			contentType:     "application/x-javascript",
+			contentEncoding: "",
+			body:            `var ws = new WebSocket("wss://example.com");`,
+			hostname:        "test.localhost:6189",
+			wantContains:    []string{`"ws://example.com"`},
+			wantNotContains: []string{`"wss://`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a mock HTTP response
+			resp := &http.Response{
+				StatusCode: 200,
+				Header:     make(http.Header),
+				Request: &http.Request{
+					Host: tt.hostname,
+					URL:  &url.URL{Path: "/test"},
+				},
+			}
+			resp.Header.Set("Content-Type", tt.contentType)
+			if tt.contentEncoding != "" {
+				resp.Header.Set("Content-Encoding", tt.contentEncoding)
+			}
+
+			// Compress the body according to the content encoding
+			var bodyReader io.Reader
+			if tt.contentEncoding == "gzip" {
+				var buf bytes.Buffer
+				gzWriter := gzip.NewWriter(&buf)
+				gzWriter.Write([]byte(tt.body))
+				gzWriter.Close()
+				bodyReader = &buf
+			} else if tt.contentEncoding == "deflate" {
+				var buf bytes.Buffer
+				zlibWriter := zlib.NewWriter(&buf)
+				zlibWriter.Write([]byte(tt.body))
+				zlibWriter.Close()
+				bodyReader = &buf
+			} else {
+				bodyReader = strings.NewReader(tt.body)
+			}
+			resp.Body = io.NopCloser(bodyReader)
+
+			// Call the rewrite function
+			err := ps.rewriteProtocolInResponse(resp)
+			if err != nil {
+				t.Fatalf("rewriteProtocolInResponse failed: %v", err)
+			}
+
+			// Read the modified response
+			modifiedBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Failed to read modified body: %v", err)
+			}
+			modifiedStr := string(modifiedBody)
+
+			// Check that expected strings are present
+			for _, want := range tt.wantContains {
+				if !strings.Contains(modifiedStr, want) {
+					t.Errorf("Expected modified body to contain %q, got: %s", want, modifiedStr)
+				}
+			}
+
+			// Check that unwanted strings are not present
+			for _, notWant := range tt.wantNotContains {
+				if strings.Contains(modifiedStr, notWant) {
+					t.Errorf("Expected modified body to NOT contain %q, got: %s", notWant, modifiedStr)
+				}
+			}
+
+			// Verify Content-Encoding header is removed
+			if resp.Header.Get("Content-Encoding") != "" {
+				t.Errorf("Expected Content-Encoding header to be removed, got: %s", resp.Header.Get("Content-Encoding"))
+			}
+		})
 	}
 }
