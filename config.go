@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 
@@ -61,8 +62,13 @@ func LoadConfig(filename string) (*Config, error) {
 				return nil, fmt.Errorf("bastion set %s, bastion %s: fingerprint is required", setName, bastions[i].Name)
 			}
 		}
+		// Shuffle bastions once for random load distribution
+		rand.Shuffle(len(bastions), func(i, j int) {
+			bastions[i], bastions[j] = bastions[j], bastions[i]
+		})
 		config.BastionSets[setName] = bastions
 	}
 
 	return &config, nil
+
 }

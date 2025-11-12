@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -31,16 +30,9 @@ type Connection struct {
 }
 
 func NewConnection(setName string, bastions []Bastion) *Connection {
-	// Shuffle bastions for random load distribution
-	shuffled := make([]Bastion, len(bastions))
-	copy(shuffled, bastions)
-	rand.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
-
 	return &Connection{
 		setName:      setName,
-		bastions:     shuffled,
+		bastions:     bastions,
 		currentIndex: 0,
 		stopCh:       make(chan struct{}),
 		readyCh:      make(chan struct{}),
