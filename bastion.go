@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -68,9 +69,12 @@ func (bc *Connection) Connect() error {
 }
 
 func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
-	agentSock := os.Getenv("SSH_AUTH_SOCK")
+	agentSock, err := getAgentSocket(bastion.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SSH agent socket: %w", err)
+	}
 	if agentSock == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK not set, SSH agent required")
+		return nil, fmt.Errorf("SSH agent socket not found (check SSH_AUTH_SOCK or .ssh/config IdentityAgent)")
 	}
 
 	agentConn, err := net.Dial("unix", agentSock)
@@ -235,4 +239,58 @@ func (bc *Connection) Close() {
 		bc.client.Close()
 		bc.client = nil
 	}
+}
+
+// getAgentSocket resolves the SSH agent socket path for a given hostname.
+// It first checks .ssh/config using `ssh -G` to respect IdentityAgent settings,
+// then falls back to SSH_AUTH_SOCK environment variable.
+func getAgentSocket(hostname string) (string, error) {
+	// Try to get IdentityAgent from ssh -G
+	identityAgent, err := getIdentityAgentFromSSHConfig(hostname)
+	if err != nil {
+		// If ssh -G fails, fall back to SSH_AUTH_SOCK
+		log.Printf("Warning: ssh -G failed for %s: %v, falling back to SSH_AUTH_SOCK", hostname, err)
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	// Handle special values
+	if identityAgent == "" || identityAgent == "none" {
+		// Not set or explicitly disabled, use SSH_AUTH_SOCK
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	if identityAgent == "SSH_AUTH_SOCK" {
+		// Explicitly set to use the environment variable
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	// ssh -G has already expanded paths (e.g., ~ to home directory)
+	// so we can use the value directly
+	return identityAgent, nil
+}
+
+// getIdentityAgentFromSSHConfig uses `ssh -G` to resolve the IdentityAgent setting
+// for a given hostname from .ssh/config files.
+func getIdentityAgentFromSSHConfig(hostname string) (string, error) {
+	cmd := exec.Command("ssh", "-G", hostname)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ssh -G %s failed: %w", hostname, err)
+	}
+
+	// Parse output line by line looking for "identityagent"
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "identityagent ") {
+			// Extract value after "identityagent "
+			fields := strings.SplitN(line, " ", 2)
+			if len(fields) == 2 {
+				return fields[1], nil
+			}
+		}
+	}
+
+	// identityagent not found in output, return empty string
+	return "", nil
 }
