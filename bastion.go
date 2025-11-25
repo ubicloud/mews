@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,9 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+// identityAgentRegex matches the identityagent line from ssh -G output
+var identityAgentRegex = regexp.MustCompile(`(?m)^identityagent\s+(.*)$`)
 
 // Connection manages a single SSH connection to a bastion set
 type Connection struct {
@@ -68,9 +73,12 @@ func (bc *Connection) Connect() error {
 }
 
 func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
-	agentSock := os.Getenv("SSH_AUTH_SOCK")
+	agentSock, err := getAgentSocket(bastion.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SSH agent socket: %w", err)
+	}
 	if agentSock == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK not set, SSH agent required")
+		return nil, fmt.Errorf("SSH agent socket not found (check -agent flag, .ssh/config IdentityAgent, or SSH_AUTH_SOCK)")
 	}
 
 	agentConn, err := net.Dial("unix", agentSock)
@@ -235,4 +243,58 @@ func (bc *Connection) Close() {
 		bc.client.Close()
 		bc.client = nil
 	}
+}
+
+// getAgentSocket resolves the SSH agent socket path for a given hostname.
+// Precedence order (highest to lowest):
+// 1. -agent flag (agentSocket global variable from main.go)
+// 2. .ssh/config IdentityAgent setting (via ssh -G)
+// 3. SSH_AUTH_SOCK environment variable
+func getAgentSocket(hostname string) (string, error) {
+	// 1. Check -agent flag (highest precedence)
+	if agentSocket != "" {
+		return agentSocket, nil
+	}
+
+	// 2. Try to get IdentityAgent from ssh -G
+	identityAgent, err := getIdentityAgentFromSSHConfig(hostname)
+	if err != nil {
+		// If ssh -G fails, fall back to SSH_AUTH_SOCK
+		log.Printf("Warning: ssh -G failed for %s: %v, falling back to SSH_AUTH_SOCK", hostname, err)
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	// Handle special values
+	if identityAgent == "" || identityAgent == "none" {
+		// Not set or explicitly disabled, use SSH_AUTH_SOCK
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	if identityAgent == "SSH_AUTH_SOCK" {
+		// Explicitly set to use the environment variable
+		return os.Getenv("SSH_AUTH_SOCK"), nil
+	}
+
+	// ssh -G has already expanded paths (e.g., ~ to home directory)
+	// so we can use the value directly
+	return identityAgent, nil
+}
+
+// getIdentityAgentFromSSHConfig uses `ssh -G` to resolve the IdentityAgent setting
+// for a given hostname from .ssh/config files.
+func getIdentityAgentFromSSHConfig(hostname string) (string, error) {
+	cmd := exec.Command("ssh", "-G", hostname)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ssh -G %s failed: %w", hostname, err)
+	}
+
+	// Use regex to find `identityagent` value
+	matches := identityAgentRegex.FindSubmatch(output)
+	if len(matches) > 1 {
+		return string(matches[1]), nil
+	}
+
+	// identityagent not found in output, return empty string
+	return "", nil
 }

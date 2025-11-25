@@ -9,9 +9,13 @@ import (
 	"syscall"
 )
 
+// agentSocket is set by the -agent flag and used by bastion.go
+var agentSocket string
+
 func main() {
 	configFile := flag.String("config", "mews.yaml", "Path to configuration file")
 	port := flag.String("port", "6189", "Port to listen on (always binds to localhost)")
+	flag.StringVar(&agentSocket, "agent", "", "Path to SSH agent socket (overrides .ssh/config and SSH_AUTH_SOCK)")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configFile)
