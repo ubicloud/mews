@@ -18,8 +18,13 @@ systems implement this in their DNS stacks, though macOS is not among
 them. However, Firefox and Chrome (but not Safari) take it upon
 themselves to implement this, so the feature remains usable.
 
-`mews` exclusively relies on ssh agent protocol for its credentials
-via `SSH_AUTH_SOCK`, just like the openssh `ssh` binary.
+`mews` exclusively relies on ssh agent protocol for its credentials.
+It sources its `ssh-agent` in an order similar to OpenSSH, listed here
+in **increasing** precedence:
+
+1. The environment variable `SSH_AUTH_SOCK`
+2. Via .`ssh/config` by running `ssh -G <TARGET>`
+3. The flag `-agent=<SOMEPATH>`
 
 ### Minimal `mews.yaml` example
 
