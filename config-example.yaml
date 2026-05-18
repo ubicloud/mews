@@ -10,6 +10,10 @@ bastions:
       port: "22"
       user: "admin"
       fingerprint: "SHA256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+      # Uncomment to pivot upstreams behind this bastion through a relay
+      # in its host network namespace. Empty string = pivot but run the
+      # relay unwrapped; absent = no pivot. See pivot.go for details.
+      # pivot_command: "sudo -n nsenter --net=/var/run/netns/host --"
     - name: "bastion-b"
       host: "bastion-b.dc1.example.com"
       port: "22"

@@ -202,7 +202,9 @@ func (ps *Server) getOrCreateTransport(upstream *Upstream) (*http.Transport, err
 		if err != nil {
 			return nil, err
 		}
-		transport.DialContext = conn.Dial
+		// bastionDialer decides per dial whether to pivot (the active bastion
+		// has a pivot_command) or fall through to plain conn.Dial.
+		transport.DialContext = bastionDialer(conn, upstream.Local)
 		log.Printf("Created cached transport for %s via bastion set %s", upstream.Local, upstream.BastionSet)
 	} else {
 		log.Printf("Created cached transport for %s (direct connection)", upstream.Local)

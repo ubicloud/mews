@@ -15,6 +15,14 @@ type Bastion struct {
 	Port        string `yaml:"port"`
 	User        string `yaml:"user"`
 	Fingerprint string `yaml:"fingerprint"`
+	// PivotCommand controls host-namespace pivoting for upstreams reached
+	// through this bastion (see the pivot.go header):
+	//   - absent (nil)       -- no pivot; dial the upstream with direct-tcpip.
+	//   - present, ""        -- pivot; run the relay unwrapped (a bastion
+	//                           ForceCommand is expected to enter the namespace).
+	//   - present, non-empty -- pivot; this command wraps the relay, e.g.
+	//                           "sudo -n nsenter --net=/var/run/netns/host --".
+	PivotCommand *string `yaml:"pivot_command,omitempty"`
 }
 
 type Config struct {
