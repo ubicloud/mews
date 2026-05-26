@@ -202,9 +202,9 @@ func (ps *Server) getOrCreateTransport(upstream *Upstream) (*http.Transport, err
 		if err != nil {
 			return nil, err
 		}
-		// bastionDialer decides per dial whether to pivot (the active bastion
-		// has a pivot_command) or fall through to plain conn.Dial.
-		transport.DialContext = bastionDialer(conn, upstream.Local)
+		// muxerDialer decides per dial whether to mux (the active bastion
+		// has a `muxer`) or fall through to plain conn.Dial.
+		transport.DialContext = muxerDialer(conn)
 		log.Printf("Created cached transport for %s via bastion set %s", upstream.Local, upstream.BastionSet)
 	} else {
 		log.Printf("Created cached transport for %s (direct connection)", upstream.Local)
@@ -613,8 +613,14 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 	// End headers
 	fmt.Fprintf(tlsConn, "\r\n")
 
-	// Read the upgrade response
-	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), r)
+	// Read the upgrade response. Keep the bufio reader: http.ReadResponse
+	// will fill its 4 KB buffer from tlsConn, and for HTTP upgrade the BMC
+	// often packs the 101 headers and its first WebSocket frame into the
+	// same TLS record. resp.Body for a 101 is empty, so those prefetched
+	// bytes aren't reachable through it; we need to drain the bufio
+	// directly in the subsequent io.Copy below.
+	upstreamReader := bufio.NewReader(tlsConn)
+	resp, err := http.ReadResponse(upstreamReader, r)
 	if err != nil {
 		log.Printf("WS ERROR: Reading upgrade response: %v", err)
 		return
@@ -638,7 +644,11 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		}()
 
 		go func() {
-			io.Copy(clientConn, tlsConn)
+			// Drain whatever bufio prefetched from the upgrade response
+			// before falling through to the live tlsConn. Without this,
+			// any initial WebSocket frames the server packed alongside
+			// its 101 headers are silently dropped.
+			io.Copy(clientConn, io.MultiReader(upstreamReader, tlsConn))
 			done <- struct{}{}
 		}()
 

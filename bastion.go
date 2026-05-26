@@ -32,6 +32,10 @@ type Connection struct {
 	stopCh       chan struct{}
 	readyCh      chan struct{}
 	readyOnce    sync.Once
+
+	// Muxer relay state (see muxer.go). Owned by acquireMuxer/dropMuxer.
+	muxerMu sync.Mutex
+	relay   *muxerRelay
 }
 
 func NewConnection(setName string, bastions []Bastion) *Connection {
@@ -166,6 +170,7 @@ func (bc *Connection) reconnect() {
 		bc.client = nil
 	}
 	bc.mu.Unlock()
+	bc.dropMuxer()
 
 	log.Printf("Reconnecting bastion set %s (was connected to %s)...", bc.setName, oldBastion)
 
@@ -235,6 +240,7 @@ func (bc *Connection) WaitReady() <-chan struct{} {
 
 func (bc *Connection) Close() {
 	close(bc.stopCh)
+	bc.dropMuxer()
 
 	bc.mu.Lock()
 	defer bc.mu.Unlock()

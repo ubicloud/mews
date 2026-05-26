@@ -15,14 +15,11 @@ type Bastion struct {
 	Port        string `yaml:"port"`
 	User        string `yaml:"user"`
 	Fingerprint string `yaml:"fingerprint"`
-	// PivotCommand controls host-namespace pivoting for upstreams reached
-	// through this bastion (see the pivot.go header):
-	//   - absent (nil)       -- no pivot; dial the upstream with direct-tcpip.
-	//   - present, ""        -- pivot; run the relay unwrapped (a bastion
-	//                           ForceCommand is expected to enter the namespace).
-	//   - present, non-empty -- pivot; this command wraps the relay, e.g.
-	//                           "sudo -n nsenter --net=/var/run/netns/host --".
-	PivotCommand *string `yaml:"pivot_command,omitempty"`
+	// Muxer = true: this bastion's sshd ForceCommand runs the mews mux relay
+	// (muxer.py or a wrapper around it), and mews opens one session channel
+	// and treats its stdio as a multiplexed stream protocol. See muxer.go.
+	// Default false: mews uses plain direct-tcpip through the SSH transport.
+	Muxer bool `yaml:"muxer,omitempty"`
 }
 
 type Config struct {
