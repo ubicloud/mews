@@ -177,6 +177,25 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 func (s *Stream) CloseWrite() error { return s.mux.frame(tDATA, fFIN, s.id, nil) }
 
+// Close retires the stream: sends FIN to the peer, unblocks any in-flight
+// Read (which then returns io.EOF) and Write (io.ErrClosedPipe), and
+// removes the stream from the mux's table so subsequent frames carrying
+// this id are silently dropped. This is what net.Conn.Close has to do:
+// a half-close via CloseWrite alone leaves a partner io.Copy goroutine
+// stuck on Read, which most visibly breaks bidirectional WebSocket
+// relays since BMCs don't react to TCP half-close in WS mode.
+func (s *Stream) Close() error {
+	err := s.mux.frame(tDATA, fFIN, s.id, nil)
+	s.mu.Lock()
+	s.dead = true
+	s.cond.Broadcast()
+	s.mu.Unlock()
+	s.mux.smu.Lock()
+	delete(s.mux.streams, s.id)
+	s.mux.smu.Unlock()
+	return err
+}
+
 func (s *Stream) deliver(p []byte) {
 	s.mu.Lock()
 	s.rcv = append(s.rcv, p...)

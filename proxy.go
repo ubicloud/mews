@@ -524,15 +524,21 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		return
 	}
 
-	// Ensure the host includes a port
-	dialAddr := parsedURL.Host
-	if !strings.Contains(dialAddr, ":") {
+	// Ensure the host includes a port. parsedURL.Port() returns "" when no
+	// explicit port is present, and Hostname() unwraps IPv6 brackets;
+	// net.JoinHostPort rewraps them. Doing this with strings.Contains(":")
+	// silently breaks for bracketed IPv6 literals: their internal colons
+	// look identical to a port separator, so the default :443/:80 never
+	// gets appended and the muxer relay sees a malformed destination.
+	port := parsedURL.Port()
+	if port == "" {
 		if parsedURL.Scheme == "https" {
-			dialAddr += ":443"
+			port = "443"
 		} else {
-			dialAddr += ":80"
+			port = "80"
 		}
 	}
+	dialAddr := net.JoinHostPort(parsedURL.Hostname(), port)
 
 	// Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
