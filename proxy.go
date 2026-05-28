@@ -558,12 +558,12 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 	// Dial the upstream server
 	var upstreamConn net.Conn
 	if upstream.BastionSet != "" {
-		conn, err := ps.getOrCreateConnection(upstream.BastionSet)
+		transport, err := ps.getOrCreateTransport(upstream)
 		if err != nil {
-			log.Printf("Error getting bastion connection: %v", err)
+			log.Printf("Error getting bastion transport: %v", err)
 			return
 		}
-		upstreamConn, err = conn.Dial(r.Context(), "tcp", dialAddr)
+		upstreamConn, err = transport.DialContext(r.Context(), "tcp", dialAddr)
 		if err != nil {
 			log.Printf("Error dialing through bastion: %v", err)
 			return
