@@ -617,7 +617,8 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 	fmt.Fprintf(tlsConn, "\r\n")
 
 	// Read the upgrade response
-	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), r)
+	upstreamReader := bufio.NewReader(tlsConn)
+	resp, err := http.ReadResponse(upstreamReader, r)
 	if err != nil {
 		log.Printf("WS ERROR: Reading upgrade response: %v", err)
 		return
@@ -641,7 +642,7 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		}()
 
 		go func() {
-			io.Copy(clientConn, tlsConn)
+			io.Copy(clientConn, io.MultiReader(upstreamReader, tlsConn))
 			done <- struct{}{}
 		}()
 
