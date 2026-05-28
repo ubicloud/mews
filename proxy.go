@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -522,15 +523,19 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		return
 	}
 
-	// Ensure the host includes a port
-	dialAddr := parsedURL.Host
-	if !strings.Contains(dialAddr, ":") {
-		if parsedURL.Scheme == "https" {
-			dialAddr += ":443"
-		} else {
-			dialAddr += ":80"
-		}
+	// Set port based on protocol
+	port := 0
+	switch parsedURL.Scheme {
+	case "http":
+		port = 80
+	case "https":
+		port = 443
+	default:
+		http.Error(w, fmt.Sprintf("unsupported scheme: %q", parsedURL.Scheme), http.StatusInternalServerError)
+		return
 	}
+
+	dialAddr := net.JoinHostPort(parsedURL.Hostname(), strconv.Itoa(port))
 
 	// Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
