@@ -15,6 +15,13 @@ type Bastion struct {
 	Port        string `yaml:"port"`
 	User        string `yaml:"user"`
 	Fingerprint string `yaml:"fingerprint"`
+	// This bastion's sshd ForceCommand runs a mux server
+	// automatically, and mews expects to use stdin/stdout with
+	// the mux protocol.
+	//
+	// Default false: mews uses plain direct-tcpip through the SSH
+	// transport.
+	Muxer bool `yaml:"muxer,omitempty"`
 }
 
 type Config struct {

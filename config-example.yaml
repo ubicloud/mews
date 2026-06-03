@@ -21,17 +21,20 @@ bastions:
       user: "admin"
       fingerprint: "SHA256:3456789012cdef013456789012cdef013456789012cdef013456789012cdef01"
   
-  # Datacenter 2 bastions
+  # Datacenter 2 bastions, configured with muxer mode, typically held
+  # uniform among bastions and with a special user.
   dc2-bastions:
     - name: "bastion-d"
       host: "bastion-d.dc2.example.com"
       port: "22"
-      user: "admin"
+      user: "muxer"
+      muxer: true
       fingerprint: "SHA256:4567890123def0124567890123def0124567890123def0124567890123def012"
     - name: "bastion-e"
       host: "bastion-e.dc2.example.com"
       port: "22"
-      user: "admin"
+      user: "muxer"
+      muxer: true
       fingerprint: "SHA256:567890124ef01235678901234ef01235678901234ef01235678901234ef0123"
 
 # Define upstreams
