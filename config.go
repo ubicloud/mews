@@ -15,6 +15,11 @@ type Bastion struct {
 	Port        string `yaml:"port"`
 	User        string `yaml:"user"`
 	Fingerprint string `yaml:"fingerprint"`
+	// Muxer = true: this bastion's sshd ForceCommand runs the mews mux relay
+	// (muxer.py or a wrapper around it), and mews opens one session channel
+	// and treats its stdio as a multiplexed stream protocol. See muxer.go.
+	// Default false: mews uses plain direct-tcpip through the SSH transport.
+	Muxer bool `yaml:"muxer,omitempty"`
 }
 
 type Config struct {
