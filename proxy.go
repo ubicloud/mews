@@ -202,7 +202,9 @@ func (ps *Server) getOrCreateTransport(upstream *Upstream) (*http.Transport, err
 		if err != nil {
 			return nil, err
 		}
-		transport.DialContext = conn.Dial
+		// muxerDialer decides per dial whether to mux (the active bastion
+		// has a `muxer`) or fall through to plain conn.Dial.
+		transport.DialContext = muxerDialer(conn)
 		log.Printf("Created cached transport for %s via bastion set %s", upstream.Local, upstream.BastionSet)
 	} else {
 		log.Printf("Created cached transport for %s (direct connection)", upstream.Local)
