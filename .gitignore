@@ -77,3 +77,8 @@ tmbootpicker.efi
 
 # Go workspace file
 go.work
+
+# It's useful to keep the copies around but probably not a good idea
+# to accidentally push them onto the internet.
+
+*.yaml
