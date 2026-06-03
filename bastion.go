@@ -32,6 +32,14 @@ type Connection struct {
 	stopCh       chan struct{}
 	readyCh      chan struct{}
 	readyOnce    sync.Once
+
+	// Muxer state (see muxer.go). When the active bastion has muxer: true,
+	// bc.sshMuxer caches one sshMuxer -- an SSH session whose stdio carries a
+	// stream-multiplexing protocol -- so all upstream dials share one session
+	// instead of opening a channel each. muxerMu guards the field; only
+	// getOrCreateMuxer/dropMuxer touch it. nil when no muxer has started.
+	muxerMu  sync.Mutex
+	sshMuxer *sshMuxer
 }
 
 func NewConnection(setName string, bastions []Bastion) *Connection {
@@ -166,6 +174,7 @@ func (bc *Connection) reconnect() {
 		bc.client = nil
 	}
 	bc.mu.Unlock()
+	bc.dropMuxer()
 
 	log.Printf("Reconnecting bastion set %s (was connected to %s)...", bc.setName, oldBastion)
 
@@ -235,6 +244,7 @@ func (bc *Connection) WaitReady() <-chan struct{} {
 
 func (bc *Connection) Close() {
 	close(bc.stopCh)
+	bc.dropMuxer()
 
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
