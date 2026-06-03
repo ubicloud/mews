@@ -118,14 +118,14 @@ func (lb *loopback) run(stop chan struct{}) {
 			}
 		}
 		switch t {
-		case tSYN:
+		case kindOPEN:
 			s := &echoStream{id: id, swin: initialWindow}
 			s.cond = sync.NewCond(&s.mu)
 			lb.mu.Lock()
 			lb.echo[id] = s
 			lb.mu.Unlock()
 			go lb.echoServe(s)
-		case tDATA:
+		case kindDATA:
 			lb.mu.Lock()
 			s := lb.echo[id]
 			lb.mu.Unlock()
@@ -136,12 +136,12 @@ func (lb *loopback) run(stop chan struct{}) {
 			if len(p) > 0 {
 				s.rcv = append(s.rcv, p)
 			}
-			if fl&fFIN != 0 {
+			if fl&flagFIN != 0 {
 				s.rcvEOF = true
 			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
-		case tWIN:
+		case kindWIN:
 			if len(p) < 4 {
 				continue
 			}
@@ -170,7 +170,7 @@ func (lb *loopback) echoServe(s *echoStream) {
 		}
 		if len(s.rcv) == 0 && s.rcvEOF {
 			s.mu.Unlock()
-			_ = lb.frame(tDATA, fFIN, s.id, nil)
+			_ = lb.frame(kindDATA, flagFIN, s.id, nil)
 			return
 		}
 		chunk := s.rcv[0]
@@ -180,7 +180,7 @@ func (lb *loopback) echoServe(s *echoStream) {
 		// Refund client window for what we just consumed.
 		var d [4]byte
 		binary.BigEndian.PutUint32(d[:], uint32(len(chunk)))
-		_ = lb.frame(tWIN, 0, s.id, d[:])
+		_ = lb.frame(kindWIN, 0, s.id, d[:])
 
 		// Echo back, honoring our send window.
 		off := 0
@@ -198,7 +198,7 @@ func (lb *loopback) echoServe(s *echoStream) {
 			}
 			s.swin -= k
 			s.mu.Unlock()
-			_ = lb.frame(tDATA, 0, s.id, chunk[off:off+int(k)])
+			_ = lb.frame(kindDATA, 0, s.id, chunk[off:off+int(k)])
 			off += int(k)
 		}
 	}
