@@ -93,11 +93,11 @@ func (bc *Connection) dropMuxer() {
 func muxerDialer(conn *Connection) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 
-		// Dial normally if muxer is false.
+		// Plain direct-tcpip unless this bastion speaks funpipe.
 		conn.mu.RLock()
-		muxer := conn.bastions[conn.currentIndex].Muxer
+		protocol := conn.bastions[conn.currentIndex].Protocol
 		conn.mu.RUnlock()
-		if !muxer {
+		if protocol != ProtocolFunpipe {
 			return conn.Dial(ctx, network, addr)
 		}
 

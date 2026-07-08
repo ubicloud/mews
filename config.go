@@ -9,19 +9,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Protocol selects how mews carries upstream dials over the SSH connection
+// to a bastion.
+//
+//   - ProtocolDirectTCPIP: plain direct-tcpip through the SSH transport.
+//     One SSH channel per dial. No bastion-side program required.
+//   - ProtocolFunpipe: the bastion's sshd ForceCommand runs the funpipe
+//     server, and mews speaks the funpipe stream-mux protocol over one
+//     session's stdin/stdout, multiplexing all dials over it.
+type Protocol string
+
+const (
+	ProtocolDirectTCPIP Protocol = "direct-tcpip"
+	ProtocolFunpipe     Protocol = "funpipe"
+)
+
 type Bastion struct {
 	Name        string `yaml:"name"`
 	Host        string `yaml:"host"`
 	Port        string `yaml:"port"`
 	User        string `yaml:"user"`
 	Fingerprint string `yaml:"fingerprint"`
-	// This bastion's sshd ForceCommand runs a mux server
-	// automatically, and mews expects to use stdin/stdout with
-	// the mux protocol.
-	//
-	// Default false: mews uses plain direct-tcpip through the SSH
-	// transport.
-	Muxer bool `yaml:"muxer,omitempty"`
+	// How mews carries dials over this bastion. One of "direct-tcpip"
+	// or "funpipe". Defaults to "direct-tcpip" when unset. See Protocol.
+	Protocol Protocol `yaml:"protocol,omitempty"`
 }
 
 type Config struct {
@@ -67,6 +78,17 @@ func LoadConfig(filename string) (*Config, error) {
 			}
 			if bastions[i].Fingerprint == "" {
 				return nil, fmt.Errorf("bastion set %s, bastion %s: fingerprint is required", setName, bastions[i].Name)
+			}
+			switch bastions[i].Protocol {
+			case ProtocolDirectTCPIP, ProtocolFunpipe:
+				// ok
+				//
+			case "":
+				bastions[i].Protocol = ProtocolDirectTCPIP
+
+			default:
+				return nil, fmt.Errorf("bastion set %s, bastion %s: unknown protocol %q (expected %q or %q)",
+					setName, bastions[i].Name, bastions[i].Protocol, ProtocolDirectTCPIP, ProtocolFunpipe)
 			}
 		}
 		// Shuffle bastions once for random load distribution
