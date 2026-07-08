@@ -5,12 +5,28 @@
 // Kinds: 0=OPEN(payload=destination) 1=DATA 2=WIN(u32 credit)
 //
 // Client-only: this peer initiates streams; inbound OPENs are dropped.
+//
+// Errors: Read returns io.EOF only for a clean peer FIN. Unclean teardown
+// surfaces as ErrClosed (the Mux was closed under the stream) or
+// ErrStreamClosed (the stream was closed locally), never as a clean EOF.
 package mux
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"sync"
+)
+
+// Sentinel errors. Defined here rather than borrowing io.ErrClosedPipe so
+// the package owns its error contract (callers errors.Is against these).
+var (
+	// ErrClosed is returned by Open after Mux.Close, and by Stream
+	// operations on streams the close tore down.
+	ErrClosed = errors.New("mux: closed")
+	// ErrStreamClosed is returned by Stream operations after the
+	// stream's own Close.
+	ErrStreamClosed = errors.New("mux: stream closed")
 )
 
 const (
@@ -36,12 +52,12 @@ func NewRW(r io.Reader, w io.Writer) *Mux {
 }
 
 // Open initiates a stream; the OPEN frame carries the destination payload.
-// Returns io.ErrClosedPipe if the mux is Closed (races a muxerDialer reconnect).
+// Returns ErrClosed if the mux is Closed (races a muxerDialer reconnect).
 func (m *Mux) Open(payload []byte) (*Stream, error) {
 	m.streamsMu.Lock()
 	if m.streams == nil {
 		m.streamsMu.Unlock()
-		return nil, io.ErrClosedPipe
+		return nil, ErrClosed
 	}
 	id := m.nextID
 	m.nextID++
@@ -59,7 +75,9 @@ func (m *Mux) Close() error {
 	m.streamsMu.Unlock()
 	for _, s := range streams {
 		s.mu.Lock()
-		s.dead = true
+		if s.closeErr == nil {
+			s.closeErr = ErrClosed
+		}
 		s.cond.Broadcast()
 		s.mu.Unlock()
 	}
@@ -120,7 +138,7 @@ type Stream struct {
 	cond       *sync.Cond
 	recvBuf    []byte
 	recvEOF    bool
-	dead       bool
+	closeErr   error // nil while alive; the cause of death otherwise
 	sendWindow int64
 }
 
@@ -133,12 +151,18 @@ func newStream(m *Mux, id uint32) *Stream {
 // Read returns buffered bytes and credits the peer for what it took.
 func (s *Stream) Read(p []byte) (int, error) {
 	s.mu.Lock()
-	for len(s.recvBuf) == 0 && !s.recvEOF && !s.dead {
+	for len(s.recvBuf) == 0 && !s.recvEOF && s.closeErr == nil {
 		s.cond.Wait()
 	}
 	if len(s.recvBuf) == 0 {
+		// io.EOF only for a clean peer FIN. A stream killed without one
+		// was truncated; clean EOF here would make data loss invisible.
+		err := io.EOF
+		if !s.recvEOF {
+			err = s.closeErr
+		}
 		s.mu.Unlock()
-		return 0, io.EOF
+		return 0, err
 	}
 	n := copy(p, s.recvBuf)
 	s.recvBuf = s.recvBuf[n:]
@@ -155,12 +179,13 @@ func (s *Stream) Write(p []byte) (int, error) {
 	for total < len(p) {
 		s.mu.Lock()
 		// Block until the peer grants window or the stream dies.
-		for s.sendWindow <= 0 && !s.dead {
+		for s.sendWindow <= 0 && s.closeErr == nil {
 			s.cond.Wait()
 		}
-		if s.dead {
+		if s.closeErr != nil {
+			err := s.closeErr
 			s.mu.Unlock()
-			return total, io.ErrClosedPipe
+			return total, err
 		}
 		k := int64(len(p) - total)
 		if k > s.sendWindow {
@@ -187,7 +212,9 @@ func (s *Stream) CloseWrite() error { return s.mux.frame(kindDATA, flagFIN, s.id
 func (s *Stream) Close() error {
 	err := s.mux.frame(kindDATA, flagFIN, s.id, nil)
 	s.mu.Lock()
-	s.dead = true
+	if s.closeErr == nil {
+		s.closeErr = ErrStreamClosed
+	}
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	s.mux.streamsMu.Lock()
