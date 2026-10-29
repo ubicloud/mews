@@ -131,7 +131,20 @@ func TestRecorderMasks(t *testing.T) {
 	}
 }
 
-// fakeBMC answers a login with a token and a cookie, and echoes every
+// vmToken is the session token the fake BMC's login gives, which the
+// browser then sends inside WebSocket frames, as a BMC's virtual media
+// has it do.
+const vmToken = "s3cr3t-vm-token-4f9a2c"
+
+// authPacket is the binary frame that carries the token: a 10-byte
+// header, 0x01, then the token zero-padded to 64 bytes. It is valid
+// UTF-8, so it is recorded as text.
+func authPacket() []byte {
+	b := append([]byte("VMHDR\x00\x00\x00\x4b\x00"), 0x01)
+	return append(b, append([]byte(vmToken), make([]byte, 64-len(vmToken))...)...)
+}
+
+// fakeBMC answers a login with a token and cookies, and echoes every
 // frame of a WebSocket at /vm, after noting what its upgrade asked for.
 type fakeBMC struct {
 	mu         sync.Mutex
@@ -143,6 +156,7 @@ func (b *fakeBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/session":
 		io.ReadAll(r.Body)
 		http.SetCookie(w, &http.Cookie{Name: "QSESSIONID", Value: "s3cr3t-session", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "SESSION", Value: vmToken, Path: "/"})
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"ok":0,"CSRFToken":"s3cr3t-csrf"}`)
 	case "/vm":
@@ -186,7 +200,9 @@ func readEvents(t *testing.T, dir string) []map[string]any {
 // TestRecordSession drives a login and a WebSocket through the proxy to
 // a fake BMC, then holds the recording to what passed: every frame both
 // ways, unmasked and in order, no secret in any file, and no extension
-// asked of the upstream.
+// asked of the upstream. The login's token, masked in the upgrade's
+// cookie, is scrubbed from the binary and the text frame that carry it
+// too, the binary frame keeping its length.
 func TestRecordSession(t *testing.T) {
 	bmc := &fakeBMC{}
 	srv := newTestHTTPSServer(t, bmc)
@@ -220,7 +236,7 @@ func TestRecordSession(t *testing.T) {
 	}
 	fmt.Fprint(conn, "GET /vm HTTP/1.1\r\nHost: bmc\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
 		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
-		"Sec-WebSocket-Extensions: permessage-deflate\r\nCookie: QSESSIONID=s3cr3t-session\r\n"+
+		"Sec-WebSocket-Extensions: permessage-deflate\r\nCookie: QSESSIONID=s3cr3t-session; SESSION="+vmToken+"\r\n"+
 		"X-CSRFTOKEN: s3cr3t-csrf\r\n\r\n")
 	br := bufio.NewReader(conn)
 	status, _ := br.ReadString('\n')
@@ -234,7 +250,7 @@ func TestRecordSession(t *testing.T) {
 	sent := []struct {
 		opcode  byte
 		payload []byte
-	}{{2, nbd}, {1, []byte(`{"cmd":"mount","token":"s3cr3t-csrf"}`)}}
+	}{{2, nbd}, {1, []byte(`{"cmd":"mount","token":"s3cr3t-csrf"}`)}, {2, authPacket()}, {1, []byte("AUTH " + vmToken)}}
 	for _, s := range sent {
 		conn.Write(clientFrame(s.opcode, s.payload))
 		f, err := readFrame(br)
@@ -254,18 +270,27 @@ func TestRecordSession(t *testing.T) {
 			n += map[bool]int{true: 1}[ev["kind"] == "ws"]
 			closed = closed || ev["kind"] == "ws-close"
 		}
-		if n == 4 && closed || time.Now().After(deadline) {
+		if n == 2*len(sent) && closed || time.Now().After(deadline) {
 			break
 		}
 	}
 
 	var kinds []string
 	var frames []string
+	tokenMask := rec.mask(vmToken)
 	for _, ev := range evs {
 		kinds = append(kinds, ev["kind"].(string))
 		if ev["kind"] == "ws" {
 			p := ev["payload"].(map[string]any)
 			frames = append(frames, fmt.Sprintf("%s %v %v", ev["dir"], ev["opcode"], p["len"]))
+			if text, _ := p["text"].(string); strings.HasPrefix(text, "VMHDR") || strings.HasPrefix(text, "AUTH") {
+				if len(text) != int(p["len"].(float64)) {
+					t.Errorf("%s frame recorded as %d bytes, not %v", ev["dir"], len(text), p["len"])
+				}
+				if masks := fmt.Sprint(p["masks"]); masks != "["+tokenMask+"]" {
+					t.Errorf("%s frame %q notes masks %s, want [%s]", ev["dir"], text, masks, tokenMask)
+				}
+			}
 			if blob, ok := p["blob"].(string); ok {
 				b, _ := os.ReadFile(filepath.Join(dir, "blobs", blob))
 				if !bytes.Equal(b, nbd) {
@@ -276,7 +301,9 @@ func TestRecordSession(t *testing.T) {
 	}
 	// A text frame is masked and written again, so its length is the masked one's.
 	text := len(rec.body(sent[1].payload, ""))
-	if got, want := strings.Join(frames, ", "), fmt.Sprintf("up 2 1208, down 2 1208, up 1 %d, down 1 %d", text, text); got != want {
+	auth := len("AUTH " + vmToken)
+	if got, want := strings.Join(frames, ", "), fmt.Sprintf("up 2 1208, down 2 1208, up 1 %d, down 1 %d, up 2 75, down 2 75, up 1 %d, down 1 %d",
+		text, text, auth, auth); got != want {
 		t.Errorf("frames: %s, want %s", got, want)
 	}
 	for _, want := range []string{"start", "http", "ws-open", "ws-close"} {

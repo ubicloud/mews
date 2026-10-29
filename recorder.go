@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,11 +34,24 @@ import (
 // names look like a password, token or session. A masked value becomes
 // <<masked:H>>, where H is an HMAC under a key made for this recording
 // alone, so one token can be followed through a recording without
-// being revealed. Binary WebSocket payloads are written as they are.
+// being revealed.
+//
+// A secret can also travel where no name marks it, as a BMC's session
+// token does inside a binary WebSocket frame. So the Recorder keeps each
+// value it has masked, if at least minSeen bytes long, in memory only,
+// and scrubs every payload and body before writing it, frames of either
+// opcode and blobs included: each occurrence of a kept value is replaced
+// by filler of the same length, so that a binary frame's layout and
+// offsets survive. The event names the masks so applied. A value is
+// caught only in what is written after it was first masked: a frame
+// written before the login that reveals its token keeps that token.
 type Recorder struct {
 	dir   string
 	key   []byte
 	start time.Time
+
+	seenMu sync.Mutex
+	seen   map[string]string // a masked value to its mask
 
 	mu  sync.Mutex
 	out *os.File
@@ -46,6 +60,10 @@ type Recorder struct {
 }
 
 const inlineMax = 512
+
+// minSeen is the shortest masked value that payloads are scrubbed of;
+// a shorter one would match by chance too often.
+const minSeen = 8
 
 // sensitiveName matches the names of headers and fields whose values are
 // masked.
@@ -64,7 +82,7 @@ func NewRecorder(dir string) (*Recorder, error) {
 		out.Close()
 		return nil, err
 	}
-	rec := &Recorder{dir: dir, key: key, start: time.Now(), out: out, enc: json.NewEncoder(out)}
+	rec := &Recorder{dir: dir, key: key, start: time.Now(), seen: map[string]string{}, out: out, enc: json.NewEncoder(out)}
 	rec.enc.SetEscapeHTML(false)
 	rec.write(map[string]any{"kind": "start", "time": rec.start.UTC().Format(time.RFC3339Nano), "format": 1})
 	return rec, nil
@@ -87,10 +105,57 @@ func (rec *Recorder) write(ev map[string]any) {
 	}
 }
 
+// mask returns v's mask, and keeps v for scrub if it is long enough.
 func (rec *Recorder) mask(v string) string {
 	m := hmac.New(sha256.New, rec.key)
 	m.Write([]byte(v))
-	return "<<masked:" + hex.EncodeToString(m.Sum(nil))[:12] + ">>"
+	masked := "<<masked:" + hex.EncodeToString(m.Sum(nil))[:12] + ">>"
+	if len(v) >= minSeen {
+		rec.seenMu.Lock()
+		rec.seen[v] = masked
+		rec.seenMu.Unlock()
+	}
+	return masked
+}
+
+// scrub replaces each occurrence in b of a value masked so far with
+// filler of the value's length: its mask, cut short or padded with '*'
+// to that length. It returns b, or a scrubbed copy, and the masks it
+// applied, sorted. Longer values go first, so that one holding another
+// is replaced whole.
+func (rec *Recorder) scrub(b []byte) ([]byte, []string) {
+	type kept struct{ value, mask string }
+	rec.seenMu.Lock()
+	all := make([]kept, 0, len(rec.seen))
+	for v, m := range rec.seen {
+		all = append(all, kept{v, m})
+	}
+	rec.seenMu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return len(all[i].value) > len(all[j].value) })
+
+	var applied []string
+	copied := false
+	for _, k := range all {
+		v := []byte(k.value)
+		if !bytes.Contains(b, v) {
+			continue
+		}
+		if !copied {
+			b, copied = append([]byte(nil), b...), true
+		}
+		filler := (k.mask + strings.Repeat("*", len(v)))[:len(v)]
+		for at := 0; ; at += len(v) {
+			i := bytes.Index(b[at:], v)
+			if i < 0 {
+				break
+			}
+			at += i
+			copy(b[at:], filler)
+		}
+		applied = append(applied, k.mask)
+	}
+	sort.Strings(applied)
+	return b, applied
 }
 
 // headers returns h with the values of credential headers masked. A
@@ -198,12 +263,17 @@ func (rec *Recorder) body(b []byte, contentType string) []byte {
 	return b
 }
 
-// payload describes b for an event: inline as text or base64 if short,
-// else by the name of the blob it is kept in.
+// payload describes b for an event, scrubbed of the values masked so
+// far: inline as text or base64 if short, else by the name of the blob
+// it is kept in, with the masks the scrub applied.
 func (rec *Recorder) payload(b []byte) map[string]any {
 	p := map[string]any{"len": len(b)}
 	if len(b) == 0 {
 		return p
+	}
+	b, applied := rec.scrub(b)
+	if len(applied) > 0 {
+		p["masks"] = applied
 	}
 	if len(b) > inlineMax {
 		sum := sha256.Sum256(b)
