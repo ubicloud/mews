@@ -67,6 +67,14 @@ func (m *Mux) Open(payload []byte) (*Stream, error) {
 	return s, m.frame(kindOPEN, 0, id, payload)
 }
 
+// Closed reports whether the Mux has been closed, either by Close or by
+// the end of its transport. Open on a closed Mux returns ErrClosed.
+func (m *Mux) Closed() bool {
+	m.streamsMu.Lock()
+	defer m.streamsMu.Unlock()
+	return m.streams == nil
+}
+
 // Close nils the stream table and wakes every stream's blocked Read/Write.
 func (m *Mux) Close() error {
 	m.streamsMu.Lock()

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -31,7 +32,11 @@ type Connection struct {
 	reconnecting bool
 	stopCh       chan struct{}
 	readyCh      chan struct{}
-	readyOnce    sync.Once
+
+	// lost is set when the link under client breaks. readyCh is closed
+	// while client is set, and Connect makes a new one when it discards
+	// client.
+	lost *atomic.Bool
 
 	// Muxer state (see muxer.go). When the active bastion has muxer: true,
 	// bc.sshMuxer caches one sshMuxer -- an SSH session whose stdio carries a
@@ -52,35 +57,45 @@ func NewConnection(setName string, bastions []Bastion) *Connection {
 	}
 }
 
-func (bc *Connection) Connect() error {
+// Connect starts connecting the set in the background, unless it is
+// already connected or an attempt is in progress. A lost client is closed
+// first.
+func (bc *Connection) Connect() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	if bc.reconnecting || bc.live() != nil {
+		return
+	}
+	bc.reconnecting = true
 	if bc.client != nil {
-		return nil // Already connected
+		bc.client.Close()
+		bc.client = nil
+		bc.readyCh = make(chan struct{})
 	}
-
-	if len(bc.bastions) == 0 {
-		return fmt.Errorf("no bastions available in set %s", bc.setName)
-	}
-
-	bastion := &bc.bastions[bc.currentIndex]
-	client, err := connectToBastion(bastion)
-	if err != nil {
-		log.Printf("Failed to connect to bastion %s in set %s: %v", bastion.Name, bc.setName, err)
-		return err
-	}
-
-	bc.client = client
-	log.Printf("Established connection to bastion set %s via %s (%d/%d)", bc.setName, bastion.Name, bc.currentIndex+1, len(bc.bastions))
-
-	// Signal that connection is ready (only once)
-	bc.readyOnce.Do(func() { close(bc.readyCh) })
-
-	return nil
+	go bc.reconnect()
 }
 
-func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
+// link is the TCP connection to a bastion. A read or write error sets lost
+// before x/crypto fails the channels on the link. Close also sets lost,
+// because x/crypto calls Close when the SSH transport ends for other reasons.
+type link struct {
+	net.Conn
+	lost *atomic.Bool
+}
+
+func (l link) Read(p []byte) (int, error)  { return l.check(l.Conn.Read(p)) }
+func (l link) Write(p []byte) (int, error) { return l.check(l.Conn.Write(p)) }
+func (l link) Close() error                { l.lost.Store(true); return l.Conn.Close() }
+
+func (l link) check(n int, err error) (int, error) {
+	if err != nil {
+		l.lost.Store(true)
+	}
+	return n, err
+}
+
+func connectToBastion(bastion *Bastion, lost *atomic.Bool) (*ssh.Client, error) {
 	agentSock, err := getAgentSocket(bastion.Host)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get SSH agent socket: %w", err)
@@ -108,7 +123,7 @@ func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
 		return nil, fmt.Errorf("failed to connect to bastion %s: %w", bastion.Name, err)
 	}
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	sshConn, chans, reqs, err := ssh.NewClientConn(link{conn, lost}, addr, config)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to establish SSH connection to bastion %s: %w", bastion.Name, err)
@@ -158,25 +173,12 @@ func verifyHostKeyFingerprint(bastion *Bastion) ssh.HostKeyCallback {
 	}
 }
 
+// reconnect tries each bastion in turn, starting after the current one.
+// Its only caller is Connect, which sets bc.reconnecting first.
 func (bc *Connection) reconnect() {
-	bc.mu.Lock()
-	if bc.reconnecting {
-		bc.mu.Unlock()
-		return // Already reconnecting
-	}
-	bc.reconnecting = true
-
-	// Close dead connection
-	oldIndex := bc.currentIndex
-	oldBastion := bc.bastions[oldIndex].Name
-	if bc.client != nil {
-		bc.client.Close()
-		bc.client = nil
-	}
-	bc.mu.Unlock()
 	bc.dropMuxer()
 
-	log.Printf("Reconnecting bastion set %s (was connected to %s)...", bc.setName, oldBastion)
+	log.Printf("Connecting bastion set %s...", bc.setName)
 
 	// Try each bastion in order (round-robin)
 	for i := 0; i < len(bc.bastions); i++ {
@@ -187,7 +189,8 @@ func (bc *Connection) reconnect() {
 		bc.mu.Unlock()
 
 		bastion := &bc.bastions[nextIndex]
-		client, err := connectToBastion(bastion)
+		lost := new(atomic.Bool)
+		client, err := connectToBastion(bastion, lost)
 		if err != nil {
 			log.Printf("Retry %d/%d: Failed to connect to bastion %s: %v", i+1, len(bc.bastions), bastion.Name, err)
 			time.Sleep(time.Duration(1+i) * time.Second) // Exponential backoff
@@ -195,11 +198,12 @@ func (bc *Connection) reconnect() {
 		}
 
 		bc.mu.Lock()
-		bc.client = client
+		bc.client, bc.lost = client, lost
 		bc.reconnecting = false
+		close(bc.readyCh)
 		bc.mu.Unlock()
 
-		log.Printf("Successfully reconnected bastion set %s to %s (%d/%d)", bc.setName, bastion.Name, nextIndex+1, len(bc.bastions))
+		log.Printf("Successfully connected bastion set %s to %s (%d/%d)", bc.setName, bastion.Name, nextIndex+1, len(bc.bastions))
 		return
 	}
 
@@ -207,12 +211,12 @@ func (bc *Connection) reconnect() {
 	bc.reconnecting = false
 	bc.mu.Unlock()
 
-	log.Printf("Failed to reconnect bastion set %s after trying all %d bastions", bc.setName, len(bc.bastions))
+	log.Printf("Failed to connect bastion set %s after trying all %d bastions", bc.setName, len(bc.bastions))
 }
 
 func (bc *Connection) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	bc.mu.RLock()
-	client := bc.client
+	client := bc.live()
 	bc.mu.RUnlock()
 
 	if client == nil {
@@ -221,24 +225,30 @@ func (bc *Connection) Dial(ctx context.Context, network, addr string) (net.Conn,
 
 	conn, err := client.Dial(network, addr)
 	if err != nil {
-		// Only trigger reconnect if the error suggests the SSH connection is dead
-		// Don't reconnect for application-level errors like "connection refused" or "missing port"
-		if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "connection reset") {
-			go bc.reconnect()
-		}
 		return nil, fmt.Errorf("failed to dial %s via bastion set %s: %w", addr, bc.setName, err)
 	}
 
 	return conn, nil
 }
 
+// live returns bc.client, or nil if its link is lost. The caller must
+// hold bc.mu.
+func (bc *Connection) live() *ssh.Client {
+	if bc.client == nil || bc.lost.Load() {
+		return nil
+	}
+	return bc.client
+}
+
 func (bc *Connection) IsConnected() bool {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	return bc.client != nil
+	return bc.live() != nil
 }
 
 func (bc *Connection) WaitReady() <-chan struct{} {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
 	return bc.readyCh
 }
 
@@ -249,9 +259,10 @@ func (bc *Connection) Close() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	// Leave client set. Closing it marks its link lost, so live returns
+	// nil, and Connect must find it to know that readyCh needs replacing.
 	if bc.client != nil {
 		bc.client.Close()
-		bc.client = nil
 	}
 }
 
