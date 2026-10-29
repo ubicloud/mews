@@ -16,6 +16,7 @@ func main() {
 	configFile := flag.String("config", "mews.yaml", "Path to configuration file")
 	port := flag.String("port", "6189", "Port to listen on (always binds to localhost)")
 	flag.StringVar(&agentSocket, "agent", "", "Path to SSH agent socket (overrides .ssh/config and SSH_AUTH_SOCK)")
+	recordDir := flag.String("record", "", "Directory to record every upstream exchange and WebSocket frame into, secrets masked")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configFile)
@@ -37,6 +38,14 @@ func main() {
 	}
 
 	server := NewServer(cfg, *port)
+	if *recordDir != "" {
+		rec, err := NewRecorder(*recordDir)
+		if err != nil {
+			log.Fatalf("Failed to start recording: %v", err)
+		}
+		server.rec = rec
+		log.Printf("  Recording into: %s", *recordDir)
+	}
 	defer server.Close()
 
 	// Handle graceful shutdown

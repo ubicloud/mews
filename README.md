@@ -89,6 +89,28 @@ go clean
 rm -f mews mews-*
 ```
 
+## Recording a session
+
+```bash
+./mews -record /path/to/recording
+```
+
+`-record` writes every exchange with an upstream into the directory:
+`events.jsonl` holds one JSON line for each HTTP request and response,
+each WebSocket opened, each frame in either direction (unmasked, in the
+order the frames crossed mews) and each close; a body or payload over
+512 bytes is kept in `blobs/`, named by its SHA-256. This is for
+learning what a BMC's web interface does, such as its virtual media, so
+that a program can do the same.
+
+Credential headers, cookie values, and JSON, form and query fields
+named like a password, token or session are masked before they are
+written, as `<<masked:H>>`, H being an HMAC under a key made for that
+recording alone. Binary frames and other bodies are written as they
+are, so read a recording before sharing it. While recording, mews asks
+the upstream for no WebSocket extension, so that no frame is
+compressed.
+
 ## Configuration
 
 See `config-example.yaml` for a complete example.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/sha256"
@@ -28,6 +29,8 @@ type Server struct {
 	connMu      sync.RWMutex
 	transports  map[string]*http.Transport
 	transportMu sync.RWMutex
+	// rec, when set, records every exchange with an upstream (-record).
+	rec *Recorder
 }
 
 func NewServer(cfg *Config, port string) *Server {
@@ -103,7 +106,15 @@ func (ps *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := ps.createReverseProxy(targetURL, transport)
-	proxy.ServeHTTP(w, r)
+	if ps.rec != nil {
+		reqBody, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		rw := &recordingWriter{ResponseWriter: w}
+		proxy.ServeHTTP(rw, r)
+		ps.rec.HTTP(r, reqBody, rw.status, rw.Header(), rw.body.Bytes())
+	} else {
+		proxy.ServeHTTP(w, r)
+	}
 
 	log.Printf("[%s] %s %s -> %s [completed in %s]", start.Format(time.RFC3339), r.Host, r.URL.Path, targetURL, time.Since(start))
 }
@@ -402,6 +413,10 @@ func (ps *Server) Close() {
 		conn.Close()
 	}
 	ps.connMu.Unlock()
+
+	if ps.rec != nil {
+		ps.rec.Close()
+	}
 }
 
 // Helper functions
@@ -608,7 +623,9 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
 		fmt.Fprintf(tlsConn, "Sec-WebSocket-Protocol: %s\r\n", proto)
 	}
-	if ext := r.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
+	// A recording asks for no extension, so that no frame is compressed
+	// (permessage-deflate) and every payload is written as sent.
+	if ext := r.Header.Get("Sec-WebSocket-Extensions"); ext != "" && ps.rec == nil {
 		fmt.Fprintf(tlsConn, "Sec-WebSocket-Extensions: %s\r\n", ext)
 	}
 
@@ -636,22 +653,36 @@ func (ps *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstre
 		return
 	}
 
+	var fromClient io.Reader = clientConn
+	var fromUpstream io.Reader = io.MultiReader(upstreamReader, tlsConn)
+	ws := 0
+	if ps.rec != nil {
+		ws = ps.rec.WebSocket(r, resp.StatusCode, resp.Header)
+	}
+
 	// If upgrade successful, start bidirectional copy
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		log.Printf("WebSocket connection established for %s -> %s", r.Host, targetURL)
-		done := make(chan struct{}, 2)
+		if ps.rec != nil {
+			up, down := ps.rec.Frames(ws, "up"), ps.rec.Frames(ws, "down")
+			fromClient, fromUpstream = io.TeeReader(fromClient, up), io.TeeReader(fromUpstream, down)
+		}
+		done := make(chan string, 2)
 
 		go func() {
-			io.Copy(tlsConn, clientConn)
-			done <- struct{}{}
+			io.Copy(tlsConn, fromClient)
+			done <- "browser"
 		}()
 
 		go func() {
-			io.Copy(clientConn, io.MultiReader(upstreamReader, tlsConn))
-			done <- struct{}{}
+			io.Copy(clientConn, fromUpstream)
+			done <- "upstream"
 		}()
 
-		<-done
+		by := <-done
+		if ps.rec != nil {
+			ps.rec.WebSocketClosed(ws, by)
+		}
 		log.Printf("WebSocket connection closed for %s", r.Host)
 	}
 }
