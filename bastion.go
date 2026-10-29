@@ -32,6 +32,10 @@ type Connection struct {
 	stopCh       chan struct{}
 	readyCh      chan struct{}
 	readyOnce    sync.Once
+	// failedCh is closed when the first connect fails, so that pages
+	// waiting on readyCh can reload and so start another attempt.
+	failedCh   chan struct{}
+	failedOnce sync.Once
 
 	// Muxer state (see muxer.go). When the active bastion has muxer: true,
 	// bc.sshMuxer caches one sshMuxer -- an SSH session whose stdio carries a
@@ -49,6 +53,7 @@ func NewConnection(setName string, bastions []Bastion) *Connection {
 		currentIndex: 0,
 		stopCh:       make(chan struct{}),
 		readyCh:      make(chan struct{}),
+		failedCh:     make(chan struct{}),
 	}
 }
 
@@ -240,6 +245,15 @@ func (bc *Connection) IsConnected() bool {
 
 func (bc *Connection) WaitReady() <-chan struct{} {
 	return bc.readyCh
+}
+
+// Failed is closed once the connection's first attempt has failed.
+func (bc *Connection) Failed() <-chan struct{} {
+	return bc.failedCh
+}
+
+func (bc *Connection) fail() {
+	bc.failedOnce.Do(func() { close(bc.failedCh) })
 }
 
 func (bc *Connection) Close() {

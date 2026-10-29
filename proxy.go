@@ -154,8 +154,15 @@ func (ps *Server) handleSSEWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	<-conn.WaitReady()
-	fmt.Fprintf(w, "data: ready\n\n")
+	msg := "ready"
+	select {
+	case <-conn.WaitReady():
+	case <-conn.Failed():
+		msg = "retry"
+	case <-r.Context().Done():
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", msg)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -291,6 +298,15 @@ func (ps *Server) startConnection(bastionSetName string) {
 	// This allows requests to other bastions to proceed while waiting for YubiKey touch
 	if err := conn.Connect(); err != nil {
 		log.Printf("Failed to connect to bastion set %s: %v", bastionSetName, err)
+		// Forget the attempt, so the next request starts another (a key
+		// not touched in time is the usual cause), and wake the pages
+		// waiting on it, which reload and so make that request.
+		ps.connMu.Lock()
+		if ps.connections[bastionSetName] == conn {
+			delete(ps.connections, bastionSetName)
+		}
+		ps.connMu.Unlock()
+		conn.fail()
 		return
 	}
 

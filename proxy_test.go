@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -568,5 +569,75 @@ func TestRewriteProtocolInResponse(t *testing.T) {
 				t.Errorf("Expected Content-Encoding header to be removed, got: %s", resp.Header.Get("Content-Encoding"))
 			}
 		})
+	}
+}
+
+// TestFailedConnectionRetries holds that a bastion set whose first connect
+// fails, as when no one touches the key in time, wakes the pages waiting on
+// it and is forgotten, so that the next request starts another attempt
+// rather than waiting forever.
+func TestFailedConnectionRetries(t *testing.T) {
+	was := agentSocket
+	agentSocket = filepath.Join(t.TempDir(), "no-agent.sock") // the connect fails at once
+	defer func() { agentSocket = was }()
+
+	cfg := &Config{
+		BastionSets: map[string][]Bastion{"s": {{Name: "b", Host: "127.0.0.1", Port: "1", User: "u"}}},
+		Upstreams:   []Upstream{{Local: "bmc", Remote: "https://[::1]", BastionSet: "s"}},
+	}
+	port, ps := startProxy(t, cfg, nil)
+
+	// A page already waiting on an attempt in progress is told to reload.
+	conn := NewConnection("s", cfg.BastionSets["s"])
+	ps.connMu.Lock()
+	ps.connections["s"] = conn
+	ps.connMu.Unlock()
+	got := make(chan string, 1)
+	go func() {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/__wait?set=s", port))
+		if err != nil {
+			got <- err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		got <- string(b)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	conn.fail()
+	select {
+	case body := <-got:
+		if body != "data: retry\n\n" {
+			t.Errorf("waiting page told %q", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting page never told")
+	}
+
+	// A failed attempt leaves the set, so the next request tries again.
+	ps.connMu.Lock()
+	delete(ps.connections, "s")
+	ps.connMu.Unlock()
+	ps.startConnection("s")
+	ps.connMu.RLock()
+	_, kept := ps.connections["s"]
+	ps.connMu.RUnlock()
+	if kept {
+		t.Error("a failed connection stays, and no request will try again")
+	}
+	if body := doProxyRequest(t, port, "bmc"); !strings.Contains(body, "Connecting to bmc") {
+		t.Errorf("the next request does not start again: %q", body)
+	}
+	// That attempt, in the background, fails and leaves in its turn.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		ps.connMu.RLock()
+		_, kept = ps.connections["s"]
+		ps.connMu.RUnlock()
+		if !kept {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second attempt never left")
+		}
 	}
 }
