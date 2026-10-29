@@ -1,9 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 func TestGetAgentSocket(t *testing.T) {
@@ -292,4 +302,175 @@ func TestAgentSocketPrecedence(t *testing.T) {
 			t.Errorf("getAgentSocket() = %q, want %q (-agent flag should override .ssh/config)", got, "/tmp/flag-override.sock")
 		}
 	})
+}
+
+// failingAgent is an agent whose key at index bad cannot sign, as when the
+// key is on a device that is not plugged in. It counts each key's signing.
+type failingAgent struct {
+	agent.ExtendedAgent
+	bad   ssh.PublicKey
+	mu    sync.Mutex
+	signs map[string]int
+}
+
+func (a *failingAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+	return a.SignWithFlags(key, data, 0)
+}
+
+func (a *failingAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	a.mu.Lock()
+	a.signs[ssh.FingerprintSHA256(key)]++
+	a.mu.Unlock()
+	if bytes.Equal(key.Marshal(), a.bad.Marshal()) {
+		return nil, errors.New("device not found")
+	}
+	return a.ExtendedAgent.SignWithFlags(key, data, flags)
+}
+
+// TestConnectToBastionSkipsKeyAgentCannotSign runs connectToBastion against
+// an agent holding two keys, the first of which cannot sign, and a server
+// that accepts the keys in accepted.
+func TestConnectToBastionSkipsKeyAgentCannotSign(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		accepted []int
+	}{
+		{"server accepts both keys", []int{0, 1}},
+		{"server accepts only the second key", []int{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyring := agent.NewKeyring().(agent.ExtendedAgent)
+			var pubs []ssh.PublicKey
+			for i := 0; i < 2; i++ {
+				_, priv, err := ed25519.GenerateKey(rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := keyring.Add(agent.AddedKey{PrivateKey: priv, Comment: fmt.Sprintf("key%d", i)}); err != nil {
+					t.Fatal(err)
+				}
+				signer, err := ssh.NewSignerFromKey(priv)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pubs = append(pubs, signer.PublicKey())
+			}
+			fa := &failingAgent{ExtendedAgent: keyring, bad: pubs[0], signs: map[string]int{}}
+
+			sock := filepath.Join(t.TempDir(), "agent.sock")
+			agentListener, err := net.Listen("unix", sock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer agentListener.Close()
+			go func() {
+				for {
+					c, err := agentListener.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						defer c.Close()
+						agent.ServeAgent(fa, c)
+					}()
+				}
+			}()
+			originalAgentSocket := agentSocket
+			agentSocket = sock
+			defer func() { agentSocket = originalAgentSocket }()
+
+			_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hostKey, err := ssh.NewSignerFromKey(hostPriv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := &ssh.ServerConfig{
+				PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+					for _, i := range tc.accepted {
+						if bytes.Equal(key.Marshal(), pubs[i].Marshal()) {
+							return nil, nil
+						}
+					}
+					return nil, errors.New("key not authorized")
+				},
+			}
+			config.AddHostKey(hostKey)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			go func() {
+				for {
+					c, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
+						if err != nil {
+							c.Close()
+							return
+						}
+						defer sshConn.Close()
+						go ssh.DiscardRequests(reqs)
+						for ch := range chans {
+							ch.Reject(ssh.Prohibited, "test server")
+						}
+					}()
+				}
+			}()
+
+			bastion := &Bastion{
+				Name:        "test-bastion",
+				Host:        "127.0.0.1",
+				Port:        fmt.Sprint(listener.Addr().(*net.TCPAddr).Port),
+				User:        "tunnel",
+				Fingerprint: ssh.FingerprintSHA256(hostKey.PublicKey()),
+			}
+			client, err := connectToBastion(bastion)
+			if err != nil {
+				t.Fatalf("connectToBastion: %v", err)
+			}
+			client.Close()
+
+			fa.mu.Lock()
+			defer fa.mu.Unlock()
+			// x/crypto asks the server about each key before signing with
+			// it, so a key the server does not accept is never signed with.
+			wantBad := 0
+			if len(tc.accepted) == 2 {
+				wantBad = 1
+			}
+			if got := fa.signs[ssh.FingerprintSHA256(pubs[0])]; got != wantBad {
+				t.Errorf("agent asked to sign with the first key %d times, want %d", got, wantBad)
+			}
+			if got := fa.signs[ssh.FingerprintSHA256(pubs[1])]; got != 1 {
+				t.Errorf("agent asked to sign with the second key %d times, want 1", got)
+			}
+		})
+	}
+}
+
+func TestDescribeKey(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := signer.PublicKey()
+	want := "ssh-ed25519 " + ssh.FingerprintSHA256(pub)
+	if got := describeKey(pub); got != want {
+		t.Errorf("describeKey = %q, want %q", got, want)
+	}
+	key := &agent.Key{Format: pub.Type(), Blob: pub.Marshal(), Comment: "yubikey-a"}
+	if got := describeKey(key); got != want+" (yubikey-a)" {
+		t.Errorf("describeKey = %q, want %q", got, want+" (yubikey-a)")
+	}
 }

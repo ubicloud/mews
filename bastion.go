@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -99,24 +100,57 @@ func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
 		return nil, fmt.Errorf("failed to connect to SSH agent: %w", err)
 	}
 
+	defer agentConn.Close()
+	agentClient := agent.NewClient(agentConn)
+
+	// x/crypto signs only with a key the server accepts, but the first
+	// signing that fails ends the handshake, so a key the agent cannot
+	// sign with (its device unplugged, or its touch not given) hides the
+	// keys after it. Like ssh, go on to the agent's other keys: connect
+	// again without each key that failed.
+	skip := make(map[string]bool)
 	addr := net.JoinHostPort(bastion.Host, bastion.Port)
-	config := &ssh.ClientConfig{
-		User:              bastion.User,
-		Auth:              []ssh.AuthMethod{ssh.PublicKeysCallback(agent.NewClient(agentConn).Signers)},
-		HostKeyCallback:   verifyHostKeyFingerprint(bastion),
-		HostKeyAlgorithms: []string{ssh.KeyAlgoED25519},
-		Timeout:           10 * time.Second,
-	}
+	var sshConn ssh.Conn
+	var chans <-chan ssh.NewChannel
+	var reqs <-chan *ssh.Request
+	for {
+		var failed ssh.PublicKey
+		signers := func() ([]ssh.Signer, error) {
+			all, err := agentClient.Signers()
+			if err != nil {
+				return nil, err
+			}
+			var signers []ssh.Signer
+			for _, s := range all {
+				if as, ok := s.(ssh.AlgorithmSigner); ok && !skip[string(s.PublicKey().Marshal())] {
+					signers = append(signers, &agentSigner{AlgorithmSigner: as, bastion: bastion.Name, failed: &failed})
+				}
+			}
+			return signers, nil
+		}
+		config := &ssh.ClientConfig{
+			User:              bastion.User,
+			Auth:              []ssh.AuthMethod{ssh.PublicKeysCallback(signers)},
+			HostKeyCallback:   verifyHostKeyFingerprint(bastion),
+			HostKeyAlgorithms: []string{ssh.KeyAlgoED25519},
+			Timeout:           10 * time.Second,
+		}
 
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to bastion %s: %w", bastion.Name, err)
-	}
+		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to bastion %s: %w", bastion.Name, err)
+		}
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
-	if err != nil {
+		sshConn, chans, reqs, err = ssh.NewClientConn(conn, addr, config)
+		if err == nil {
+			break
+		}
 		conn.Close()
-		return nil, fmt.Errorf("failed to establish SSH connection to bastion %s: %w", bastion.Name, err)
+		if failed == nil {
+			return nil, fmt.Errorf("failed to establish SSH connection to bastion %s: %w", bastion.Name, err)
+		}
+		log.Printf("SSH agent did not sign with %s for bastion %s (%v); trying its other keys", describeKey(failed), bastion.Name, err)
+		skip[string(failed.Marshal())] = true
 	}
 
 	// Handle server-sent global requests (e.g., keepalive@openssh.com)
@@ -136,6 +170,38 @@ func connectToBastion(bastion *Bastion) (*ssh.Client, error) {
 	client := ssh.NewClient(sshConn, chans, nil)
 	log.Printf("Connected to bastion %s (%s) - host key verified", bastion.Name, addr)
 	return client, nil
+}
+
+// agentSigner signs with one of the agent's keys. It logs the key before
+// asking the agent, so that the user knows which key to touch, and notes
+// the key in failed if the agent does not sign.
+type agentSigner struct {
+	ssh.AlgorithmSigner
+	bastion string
+	failed  *ssh.PublicKey
+}
+
+func (s *agentSigner) Sign(rand io.Reader, data []byte) (*ssh.Signature, error) {
+	return s.SignWithAlgorithm(rand, data, "")
+}
+
+func (s *agentSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*ssh.Signature, error) {
+	log.Printf("Asking SSH agent to sign for bastion %s with %s; touch that key if it blinks", s.bastion, describeKey(s.PublicKey()))
+	sig, err := s.AlgorithmSigner.SignWithAlgorithm(rand, data, algorithm)
+	if err != nil {
+		*s.failed = s.PublicKey()
+	}
+	return sig, err
+}
+
+// describeKey names a key by its type and SHA256 fingerprint, as ssh-add -l
+// does, followed by the agent's comment for it, if any.
+func describeKey(key ssh.PublicKey) string {
+	desc := key.Type() + " " + ssh.FingerprintSHA256(key)
+	if k, ok := key.(*agent.Key); ok && k.Comment != "" {
+		desc += " (" + k.Comment + ")"
+	}
+	return desc
 }
 
 func verifyHostKeyFingerprint(bastion *Bastion) ssh.HostKeyCallback {
