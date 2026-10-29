@@ -75,6 +75,8 @@ func (ps *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Start connection in background if not already started
 			if conn == nil {
 				go ps.startConnection(upstream.BastionSet)
+			} else {
+				conn.Connect()
 			}
 			ps.handleWaitingPage(w, upstream)
 			return
@@ -157,7 +159,7 @@ func (ps *Server) handleWaitingPage(w http.ResponseWriter, upstream *Upstream) {
 <p>Waiting for SSH authentication to bastion set <strong>%s</strong>...</p>
 <p><em>Touch your key if prompted</em></p>
 <script>
-new EventSource('/__wait?set=%s').onmessage = () => location.reload();
+new EventSource('/__wait?set=%s').onmessage = () => location.replace(location.href);
 </script>
 </body></html>`, upstream.Local, upstream.BastionSet, upstream.BastionSet)
 }
@@ -237,9 +239,7 @@ func (ps *Server) getOrCreateConnection(bastionSetName string) (*Connection, err
 	}
 
 	conn = NewConnection(bastionSetName, bastions)
-	if err := conn.Connect(); err != nil {
-		return nil, fmt.Errorf("failed to connect to bastion set %s: %w", bastionSetName, err)
-	}
+	conn.Connect()
 
 	ps.connections[bastionSetName] = conn
 	return conn, nil
@@ -276,14 +276,7 @@ func (ps *Server) startConnection(bastionSetName string) {
 	ps.connections[bastionSetName] = conn
 	ps.connMu.Unlock()
 
-	// Connect OUTSIDE the lock to avoid blocking other requests
-	// This allows requests to other bastions to proceed while waiting for YubiKey touch
-	if err := conn.Connect(); err != nil {
-		log.Printf("Failed to connect to bastion set %s: %v", bastionSetName, err)
-		return
-	}
-
-	log.Printf("Successfully connected to bastion set %s", bastionSetName)
+	conn.Connect()
 }
 
 func (ps *Server) createReverseProxy(targetURL string, transport *http.Transport) *httputil.ReverseProxy {
@@ -379,6 +372,18 @@ func (ps *Server) rewriteProtocolInResponse(resp *http.Response) error {
 
 func (ps *Server) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	log.Printf("Proxy error for %s: %v", r.URL, err)
+	ps.connMu.RLock()
+	conn := ps.connections[findUpstream(ps.upstreams, r.Host).BastionSet]
+	ps.connMu.RUnlock()
+	if conn != nil && !conn.IsConnected() {
+		// The bastion link broke under this request. Redirect the browser
+		// to the same URL, where it will get the waiting page; a 303 turns
+		// a POST into a GET, so the POST is not repeated. Collapse leading
+		// slashes, else a "//host/..." request-target would name another
+		// host.
+		http.Redirect(w, r, "/"+strings.TrimLeft(r.RequestURI, "/"), http.StatusSeeOther)
+		return
+	}
 	msg := "Bad Gateway"
 	if strings.Contains(err.Error(), "certificate pinning") {
 		msg = "Certificate Pinning Failed"

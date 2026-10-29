@@ -14,7 +14,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"time"
@@ -25,29 +24,27 @@ import (
 
 // sshMuxer is the SSH-transport layer of the muxer tower. It owns one SSH
 // session and the mux.Mux that frames many streams over that session's
-// stdio. It exists to bundle the three things that live and die together --
-// the session, its stdin, and the Mux -- so that one Close tears the whole
-// session down in order. One per Connection, started lazily by getOrCreateMuxer
+// stdio. It exists to bundle the two things that live and die together --
+// the session and the Mux -- so that one Close tears the whole session
+// down in order. One per Connection, started lazily by getOrCreateMuxer
 // and dropped by dropMuxer (see bastion.go).
 //
 // Layer tower:
 //
 //	Connection  owns the *ssh.Client and caches one sshMuxer (bc.sshMuxer)
-//	  sshMuxer  owns one ssh.Session + its stdin + one mux.Mux   (this type)
+//	  sshMuxer  owns one ssh.Session + one mux.Mux   (this type)
 //	    mux.Mux frames/demuxes many streams over the session stdio
 //	      mux.Stream  one logical stream per upstream dial
 //	        streamConn  adapts a mux.Stream to net.Conn for http.Transport
 type sshMuxer struct {
-	sess  *ssh.Session
-	stdin io.WriteCloser
-	m     *mux.Mux
+	sess *ssh.Session
+	m    *mux.Mux
 }
 
-// Close is nil-safe so callers can fire it unconditionally. Order matters:
-// stdin first signals EOF to the bastion relay, then the Mux wakes any
-// blocked streams, then the session is torn down.
+// Close closes the Mux, waking any blocked streams, and then the session,
+// which also ends the relay's stdin. Closing stdin here instead would race
+// a stream that is still writing to it.
 func (r *sshMuxer) Close() {
-	r.stdin.Close()
 	r.m.Close()
 	r.sess.Close()
 }
@@ -58,13 +55,13 @@ func (bc *Connection) getOrCreateMuxer() (*mux.Mux, error) {
 	bc.muxerMu.Lock()
 	defer bc.muxerMu.Unlock()
 
-	// Reuse the live muxer if one's already up.
-	if bc.sshMuxer != nil {
+	// Reuse the cached muxer while its relay runs.
+	if bc.sshMuxer != nil && !bc.sshMuxer.m.Closed() {
 		return bc.sshMuxer.m, nil
 	}
 	// Otherwise start one lazily on the current client.
 	bc.mu.RLock()
-	client := bc.client
+	client := bc.live()
 	bc.mu.RUnlock()
 
 	if client == nil {
@@ -142,7 +139,7 @@ func startMuxer(client *ssh.Client, setName string) (*sshMuxer, error) {
 		}
 	}()
 	log.Printf("Muxer relay up for bastion set %s", setName)
-	return &sshMuxer{sess: sess, stdin: stdin, m: mux.NewRW(stdout, stdin)}, nil
+	return &sshMuxer{sess: sess, m: mux.NewRW(stdout, stdin)}, nil
 }
 
 // streamConn adapts a mux.Stream into a net.Conn for http.Transport.
