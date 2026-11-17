@@ -1,14 +1,15 @@
 package main
 
-// Session-channel muxer. For bastions whose sshd ForceCommand runs the mews
-// mux relay (typically muxer.py or a wrapper around it), mews opens one SSH
-// session channel per bastion *ssh.Client and treats its stdio as a stream
-// multiplexer. Each upstream dial becomes one mux stream whose SYN payload
-// is "host:port"; the bastion-side relay dials and splices.
+// Session-channel muxer. For bastions whose sshd ForceCommand runs a funpipe
+// server, mews opens one SSH session channel per bastion *ssh.Client and
+// treats its stdio as a stream multiplexer. Each upstream dial becomes one
+// mux stream whose OPEN payload is "host port"; the funpipe server dials and
+// splices.
 //
-// The relay is *not* shipped by mews. The bastion sysadmin installs it (or
-// a wrapper that imports it) and points sshd ForceCommand at it. mews's only
-// job is to ask sshd for a default session and speak the protocol.
+// The funpipe server is *not* shipped by mews, and mews does not depend on
+// which implementation the bastion runs. The bastion sysadmin installs one
+// and points sshd ForceCommand at it. mews's only job is to ask sshd for a
+// default session and speak the protocol.
 
 import (
 	"bufio"
